@@ -1031,6 +1031,16 @@ eventSource.on(event_types.CHAT_CHANGED, () => {
 });
 ```
 
+**改动点 7 —— OpenAI 预设联动（`OAI_PRESET_CHANGED_AFTER`）：**
+
+新增 `applyPresetExtensions()`：加载/切换 OpenAI 预设时，从 `preset.extensions.SToolBook`
+合并 SToolBook 设置到 `extensionSettings`，并刷新 UI 与运行时配置。
+
+> 用途：把"两阶段工具目录 + 引导工具白名单"等配置**固化进预设文件**，
+> 加载预设即可一键生效（如 DarkSide-Agent 预设已内置
+> `anchoredCatalog: true` + `anchorToolWhitelist: "plan, write_content, summarize"`）。
+> 仅覆盖预设里存在的 key，未指定的 key 保留用户当前值。
+
 #### 3.3 `settings.html`
 
 新增 UI（位于"回传推理内容"之后、Debug Mode 之前）：
@@ -1115,7 +1125,7 @@ SToolBook 适合以下场景：
 | 文件 | 上游 | 本分支 |
 |---|---|---|
 | `tool-runtime.js` | 无门控；`shouldRegister` 只判断条目激活 | 新增门控状态 / API；`shouldRegister` 叠加阶段门控；`beginToolInvocation` 晋升兜底；bootstrap 空目录警告 |
-| `index.js` | 设置 5 项 | 新增 `anchoredCatalog` / `anchorToolWhitelist` 设置；chatMetadata 持久化；`hasToolCalls` 晋升检测；`CHAT_CHANGED` 恢复阶段 |
+| `index.js` | 设置 5 项 | 新增 `anchoredCatalog` / `anchorToolWhitelist` 设置；chatMetadata 持久化；`hasToolCalls` 晋升检测；`CHAT_CHANGED` 恢复阶段；`OAI_PRESET_CHANGED_AFTER` 预设联动（从 `preset.extensions.SToolBook` 合并设置） |
 | `settings.html` | 5 个控件 | 新增两阶段工具目录开关 + 白名单输入框 |
 | `README.md` | 无改动说明 | 新增"Anchored Tool Catalog 改动说明"章节 |
 | `test/anchored-catalog.test.py` | 不存在 | 新增（15 场景逻辑验证） |

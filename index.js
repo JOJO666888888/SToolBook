@@ -148,6 +148,40 @@ function onAnchoredPhaseChanged(phase) {
     debugLog(`Anchored 阶段已持久化到聊天 metadata: ${phase}`);
 }
 
+/**
+ * 从 OpenAI 预设合并 SToolBook 扩展设置（preset.extensions.SToolBook）。
+ * 让"Anchored 引导工具白名单"等配置可以随预设一键生效。
+ * 只在预设里存在对应 key 时覆盖，未指定的 key 保留用户当前值。
+ * @returns {boolean} 是否发生了设置变更
+ */
+function applyPresetExtensions() {
+    const ctx = SillyTavern.getContext();
+    const presetExt = ctx?.chatCompletionSettings?.extensions?.[MODULE_NAME];
+    if (!presetExt || typeof presetExt !== 'object') {
+        return false;
+    }
+
+    const ext = ctx.extensionSettings;
+    if (!ext[MODULE_NAME]) {
+        ext[MODULE_NAME] = { ...DEFAULT_SETTINGS };
+    }
+
+    let changed = false;
+    for (const key of Object.keys(DEFAULT_SETTINGS)) {
+        if (presetExt[key] !== undefined && ext[MODULE_NAME][key] !== presetExt[key]) {
+            ext[MODULE_NAME][key] = presetExt[key];
+            changed = true;
+        }
+    }
+
+    if (!changed) {
+        return false;
+    }
+
+    debugLog('已从 OpenAI 预设应用 SToolBook 设置:', presetExt);
+    return true;
+}
+
 // ============================================================
 // 创建抽屉 DOM
 // ============================================================
@@ -1360,6 +1394,24 @@ function setupDebugUnlock() {
         syncAnchoredCatalogConfig();
         setAnchoredPhaseChangedHandler(onAnchoredPhaseChanged);
         restoreAnchoredPhaseFromMetadata();
+
+        // 预设联动：加载/切换 OpenAI 预设时，从 preset.extensions.SToolBook 合并设置并刷新 UI
+        eventSource.on(event_types.OAI_PRESET_CHANGED_AFTER, () => {
+            if (!applyPresetExtensions()) {
+                return;
+            }
+            $('#stoolbook_seamless_tool_loop').prop('checked', getSettings().seamlessToolLoop);
+            $('#stoolbook_turn_merging').prop('checked', getSettings().turnMerging);
+            $('#stoolbook_pin_newest_turn').prop('checked', getSettings().pinNewestTurn);
+            $('#stoolbook_reasoning_passback').prop('checked', getSettings().reasoningPassback);
+            $('#stoolbook_anchored_catalog').prop('checked', getSettings().anchoredCatalog);
+            $('#stoolbook_anchor_whitelist').val(getSettings().anchorToolWhitelist ?? '');
+            syncSeamlessUI();
+            syncAnchoredUI();
+            syncAnchoredCatalogConfig();
+            restoreAnchoredPhaseFromMetadata();
+            saveSettingsDebounced();
+        });
 
         installSeamlessOverrides();
         installGlobalPromptCompat();
