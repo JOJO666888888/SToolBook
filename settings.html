@@ -21,6 +21,14 @@
                 <input type="checkbox" id="stoolbook_reasoning_passback" />
                 <span data-i18n="回传推理内容">回传推理内容</span>
             </label>
+            <label class="checkbox_label" for="stoolbook_anchored_catalog" title="两阶段工具目录（借鉴 dsh-anchored-standard）：bootstrap 阶段只向模型暴露引导工具（anchor: true 或白名单），检测到第一次工具调用后自动开放全部工具。减少首轮工具噪音，稳定模型初始轨迹。">
+                <input type="checkbox" id="stoolbook_anchored_catalog" />
+                <span data-i18n="两阶段工具目录">两阶段工具目录 (Anchored)</span>
+            </label>
+            <div id="stoolbook_anchor_whitelist_wrap" style="display:none; margin-left: 1.5em; margin-bottom: 8px;">
+                <small>引导工具白名单（逗号分隔，留空则使用工具代码中的 <code>anchor: true</code>）</small>
+                <input type="text" id="stoolbook_anchor_whitelist" class="text_pole" placeholder="read, search" />
+            </div>
             <label class="checkbox_label stoolbook_debug_toggle" for="stoolbook_debug_mode" title="输出详细调试日志到控制台" style="display:none;">
                 <input type="checkbox" id="stoolbook_debug_mode" />
                 <span>Debug Mode</span>

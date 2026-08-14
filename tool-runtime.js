@@ -56,6 +56,22 @@ let seamlessLoopStopRequest = null;
 /** @type {{ messageId: number | null, contentAppend: string } | null} */
 let pendingStepReplyAugment = null;
 
+// ============================================================
+// Anchored Tool Catalog —— 两阶段工具目录门控
+// 借鉴 dsh-anchored-standard 的思路：
+//   bootstrap 阶段只向模型暴露“引导工具”（anchor: true 或白名单匹配），
+//   检测到第一次工具调用（tool/call）后自动晋升为 full，开放全部工具。
+//   目录只变化一次 → 首轮轨迹更稳，之后无损解锁完整能力。
+// ============================================================
+const ANCHORED_PHASE_BOOTSTRAP = 'bootstrap';
+const ANCHORED_PHASE_FULL = 'full';
+let anchoredCatalogEnabled = false;
+let anchoredPhase = ANCHORED_PHASE_FULL;
+/** @type {Set<string> | null} 引导工具白名单（按工具 name/displayName 匹配）；null 表示只认工具代码里的 anchor: true */
+let anchorToolNameSet = null;
+/** @type {((phase: string) => void) | null} 阶段晋升回调（index.js 注册，用于持久化到 chatMetadata） */
+let anchoredPhaseChangedHandler = null;
+
 function clearPendingStepReplyAugment() {
     pendingStepReplyAugment = null;
 }
@@ -1061,6 +1077,78 @@ export function replaceActivatedEntries(activatedList) {
     return activatedEntries.size;
 }
 
+// ------------------------------------------------------------
+// Anchored Tool Catalog —— 门控 API
+// ------------------------------------------------------------
+
+/**
+ * 配置两阶段门控（由 index.js 在设置变更 / 聊天切换时调用）。
+ * @param {{ enabled?: boolean, anchorNames?: string[] | null }} [options]
+ */
+export function configureAnchoredCatalog({ enabled = false, anchorNames = null } = {}) {
+    anchoredCatalogEnabled = !!enabled;
+
+    if (Array.isArray(anchorNames)) {
+        anchorToolNameSet = new Set(anchorNames.map((name) => String(name).trim()).filter(Boolean));
+    } else {
+        anchorToolNameSet = null;
+    }
+}
+
+export function isAnchoredCatalogEnabled() {
+    return anchoredCatalogEnabled;
+}
+
+export function getAnchoredPhase() {
+    return anchoredPhase;
+}
+
+/**
+ * 设置阶段（bootstrap / full）。幂等：只有真正发生阶段变化时才通知持久化回调。
+ * @param {string} phase
+ * @param {{ silent?: boolean }} [options] silent=true 时不触发回调（用于从 metadata 恢复）
+ */
+export function setAnchoredPhase(phase, { silent = false } = {}) {
+    const next = phase === ANCHORED_PHASE_BOOTSTRAP ? ANCHORED_PHASE_BOOTSTRAP : ANCHORED_PHASE_FULL;
+    if (anchoredPhase === next) {
+        return;
+    }
+
+    anchoredPhase = next;
+    console.log(`[${MODULE_NAME}] Anchored Tool Catalog 阶段 → ${next}`);
+
+    if (!silent && typeof anchoredPhaseChangedHandler === 'function') {
+        try {
+            anchoredPhaseChangedHandler(next);
+        } catch (error) {
+            console.warn(`[${MODULE_NAME}] Anchored 阶段变更回调执行失败:`, error);
+        }
+    }
+}
+
+/**
+ * 注册阶段晋升回调（index.js 用它把阶段持久化到当前聊天的 chatMetadata）。
+ * @param {(phase: string) => void} handler
+ */
+export function setAnchoredPhaseChangedHandler(handler) {
+    anchoredPhaseChangedHandler = typeof handler === 'function' ? handler : null;
+}
+
+function isAnchorTool(registration) {
+    if (anchorToolNameSet && anchorToolNameSet.size > 0) {
+        return anchorToolNameSet.has(registration.toolDef.name)
+            || anchorToolNameSet.has(registration.toolDef.displayName || '');
+    }
+    return registration.toolDef.anchor === true;
+}
+
+/** shouldRegister 门控：未开启直接放行；full 阶段放行；bootstrap 阶段只放行引导工具 */
+function shouldExposeTool(registration) {
+    if (!anchoredCatalogEnabled) return true;
+    if (anchoredPhase === ANCHORED_PHASE_FULL) return true;
+    return isAnchorTool(registration);
+}
+
 export function unregisterAllTools() {
     const { unregisterFunctionTool } = SillyTavern.getContext();
 
@@ -1150,7 +1238,8 @@ export function syncToolRegistrations() {
                     ? async (args) => registration.toolDef.formatMessage(args, createToolApi(registration.meta))
                     : undefined,
                 stealth: registration.toolDef.stealth ?? false,
-                shouldRegister: () => activatedEntries.has(registration.entryKey),
+                // Anchored Tool Catalog：激活状态 + 两阶段门控（shouldRegister 在每次请求构建时被 SillyTavern 动态调用）
+                shouldRegister: () => activatedEntries.has(registration.entryKey) && shouldExposeTool(registration),
             });
 
             registeredTools.set(toolId, registration.uuid);
@@ -1158,6 +1247,18 @@ export function syncToolRegistrations() {
             console.log(`[${MODULE_NAME}] 已注册工具: ${toolId} (来自 ${registration.worldName}[${registration.uid}])`);
         } catch (error) {
             console.error(`[${MODULE_NAME}] 注册工具 ${toolId} 失败:`, error);
+        }
+    }
+
+    // bootstrap 阶段提示：如果当前有可注册工具但没有匹配到任何引导工具，模型将看不到任何 SToolBook 工具
+    if (anchoredCatalogEnabled && anchoredPhase === ANCHORED_PHASE_BOOTSTRAP && shouldRegister.size > 0) {
+        const anyAnchor = [...shouldRegister.values()].some((r) => isAnchorTool(r));
+        if (!anyAnchor) {
+            console.warn(
+                `[${MODULE_NAME}] Anchored Tool Catalog 处于 bootstrap 阶段，但没有匹配到任何引导工具。`
+                + `请在工具代码里加 anchor: true，或在扩展设置里配置“引导工具白名单”；`
+                + `否则当前所有 SToolBook 工具在本阶段都不可见。`,
+            );
         }
     }
 }
@@ -1210,6 +1311,12 @@ export function beginToolInvocation(input) {
     };
 
     toolInvocationStack.push(invocation);
+
+    // Anchored Tool Catalog：任何真实工具执行都视为“会话已产生 tool/call”，触发晋升（幂等）
+    if (anchoredCatalogEnabled && anchoredPhase === ANCHORED_PHASE_BOOTSTRAP) {
+        setAnchoredPhase(ANCHORED_PHASE_FULL);
+    }
+
     return invocation;
 }
 

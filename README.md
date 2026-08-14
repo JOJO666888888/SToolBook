@@ -21,6 +21,8 @@
 - [完整示例](#完整示例)
 - [行为说明与注意事项](#行为说明与注意事项)
 - [常见问题](#常见问题)
+- [Anchored Tool Catalog 改动说明](#anchored-tool-catalog-改动说明)
+- [本分支与上游差异](#本分支与上游差异)
 
 ---
 
@@ -883,6 +885,215 @@ api.util.log('debug info', data);
 
 ---
 
+## Anchored Tool Catalog 改动说明
+
+> 本分支在 SToolBook 1.3.0 基础上新增 **Anchored Tool Catalog（两阶段工具目录）**，
+> 思路借鉴自 [xiaobright/dsh-anchored-standard](https://github.com/xiaobright/dsh-anchored-standard)：
+> DeepSeek 等模型会强烈依赖 API 中**可见的工具目录**选择执行轨迹，目录少则首轮轨迹更稳，
+> 目录多则工具能力强但首轮容易漂移。两阶段方案把这两者拆开。
+
+### 1. 功能原理
+
+| 阶段 | 模型可见的工具 | 触发条件 |
+|---|---|---|
+| `bootstrap`（引导） | 只有标记 `anchor: true` 的工具（或白名单匹配的工具） | 新聊天 + 功能开启 |
+| `full`（完整） | 全部 SToolBook 工具 | 会话出现第一次工具调用（`tool/call`），无论执行成败 |
+
+- 阶段**跟随聊天持久化**（存于 `chatMetadata.stoolbookAnchoredPhase`），切换聊天 / 刷新页面 / 恢复存档均不丢失；
+- 工具目录**只变化一次**（bootstrap → full），对应一次前缀缓存失效；
+- 若某轮模型未调用任何工具，**不晋升**，保持 bootstrap（与 dsh 行为一致）；
+- 功能**默认关闭**，不影响原有行为，可随时开关做 AB 对比。
+
+### 2. 设置项（settings.html）
+
+| 设置 | 类型 | 说明 |
+|---|---|---|
+| `anchoredCatalog` | 开关 | 两阶段工具目录总开关，默认 `false` |
+| `anchorToolWhitelist` | 文本 | 引导工具白名单（逗号分隔工具 `name`）；留空则只认工具代码里的 `anchor: true` |
+
+### 3. 文件级改动明细
+
+#### 3.1 `tool-runtime.js`
+
+**新增状态（文件顶部）：**
+
+```js
+const ANCHORED_PHASE_BOOTSTRAP = 'bootstrap';
+const ANCHORED_PHASE_FULL = 'full';
+let anchoredCatalogEnabled = false;      // 总开关
+let anchoredPhase = ANCHORED_PHASE_FULL; // 当前阶段
+let anchorToolNameSet = null;            // 白名单（Set<string> | null）
+let anchoredPhaseChangedHandler = null;  // 晋升回调（index.js 注册，用于持久化）
+```
+
+**新增导出 API（`replaceActivatedEntries` 之后）：**
+
+| 函数 | 作用 |
+|---|---|
+| `configureAnchoredCatalog({ enabled, anchorNames })` | 同步开关与白名单（index.js 在设置变更 / 聊天切换时调用） |
+| `isAnchoredCatalogEnabled()` | 查询总开关状态 |
+| `getAnchoredPhase()` | 查询当前阶段（`'bootstrap'` / `'full'`） |
+| `setAnchoredPhase(phase, { silent })` | 设置阶段；幂等，只有真正变化才触发持久化回调；`silent=true` 用于从 metadata 恢复 |
+| `setAnchoredPhaseChangedHandler(handler)` | 注册晋升回调（index.js 用它写 chatMetadata） |
+
+**内部门控函数：**
+
+```js
+function isAnchorTool(registration) {
+    // 白名单优先：匹配 toolDef.name / displayName
+    // 否则认工具代码里的 anchor: true
+}
+
+function shouldExposeTool(registration) {
+    if (!anchoredCatalogEnabled) return true;      // 未开启 → 原行为
+    if (anchoredPhase === 'full') return true;     // 已晋升 → 全部放行
+    return isAnchorTool(registration);             // bootstrap → 只放行引导工具
+}
+```
+
+**改动点 1 —— `syncToolRegistrations()` 的 `shouldRegister` 回调：**
+
+```diff
+- shouldRegister: () => activatedEntries.has(registration.entryKey),
++ // shouldRegister 在每次请求构建时被 SillyTavern 动态调用（tool-calling.js registerFunctionToolsOpenAI）
++ shouldRegister: () => activatedEntries.has(registration.entryKey) && shouldExposeTool(registration),
+```
+
+> 这是整个方案的核心：SillyTavern 的工具目录是**每请求动态构建**的，
+> 无需注销/重注册即可实时控制"这次请求模型能看到哪些工具"。
+
+**改动点 2 —— bootstrap 空目录警告（`syncToolRegistrations` 末尾）：**
+
+bootstrap 阶段若存在可注册工具但没有任何工具匹配引导条件，输出控制台警告，
+提示用户加 `anchor: true` 或配置白名单，避免"功能开启但模型看不到任何工具"的困惑。
+
+**改动点 3 —— `beginToolInvocation()` 晋升兜底：**
+
+```js
+// 任何真实工具执行都视为“会话已产生 tool/call”，触发晋升（幂等）
+if (anchoredCatalogEnabled && anchoredPhase === ANCHORED_PHASE_BOOTSTRAP) {
+    setAnchoredPhase(ANCHORED_PHASE_FULL);
+}
+```
+
+#### 3.2 `index.js`
+
+**改动点 1 —— 新增 import：**
+
+```js
+configureAnchoredCatalog, getAnchoredPhase, setAnchoredPhase, setAnchoredPhaseChangedHandler,
+```
+
+**改动点 2 —— 新增设置项（`DEFAULT_SETTINGS`）：**
+
+```js
+anchoredCatalog: false,   // 两阶段工具目录总开关
+anchorToolWhitelist: '',  // 引导工具白名单（逗号分隔）
+```
+
+**改动点 3 —— 新增配置与持久化函数（`getSettings` 之后）：**
+
+| 函数 | 作用 |
+|---|---|
+| `parseAnchorWhitelist(raw)` | 解析逗号分隔白名单 → 去空白数组 |
+| `syncAnchoredCatalogConfig()` | 把设置同步到 tool-runtime（开关 + 白名单） |
+| `restoreAnchoredPhaseFromMetadata()` | 从 `chatMetadata` 恢复阶段；无记录且开启 → 新聊天从 bootstrap 开始 |
+| `onAnchoredPhaseChanged(phase)` | 晋升回调：写 `chatMetadata.stoolbookAnchoredPhase` 并 `saveChat()` |
+
+**改动点 4 —— `installSeamlessOverrides()` 的 `hasToolCalls` 晋升检测：**
+
+```js
+// 模型响应里出现 tool_calls 即视为“会话已产生 tool/call”，触发晋升（幂等）
+if (has && getSettings().anchoredCatalog && getAnchoredPhase() === 'bootstrap') {
+    setAnchoredPhase('full');
+}
+```
+
+> 与 dsh 语义一致：**模型发出了 tool_calls 就晋升，与工具执行成败无关**。
+> 因为 `hasToolCalls` 在解析响应阶段即被调用，覆盖 seamless 与非 seamless 全部模式。
+
+**改动点 5 —— APP_READY 设置 UI 绑定：**
+
+- `#stoolbook_anchored_catalog` 复选框绑定 `anchoredCatalog`
+- `#stoolbook_anchor_whitelist` 输入框绑定 `anchorToolWhitelist`
+- `syncAnchoredUI()` 控制白名单输入框显隐
+- 初始化时依次执行：`syncAnchoredCatalogConfig()` → `setAnchoredPhaseChangedHandler(onAnchoredPhaseChanged)` → `restoreAnchoredPhaseFromMetadata()`
+
+**改动点 6 —— `CHAT_CHANGED` 事件：**
+
+切换聊天时重新同步配置并从新聊天的 metadata 恢复阶段：
+
+```js
+eventSource.on(event_types.CHAT_CHANGED, () => {
+    syncAnchoredCatalogConfig();
+    restoreAnchoredPhaseFromMetadata();
+    ...
+});
+```
+
+#### 3.3 `settings.html`
+
+新增 UI（位于"回传推理内容"之后、Debug Mode 之前）：
+
+```html
+<label class="checkbox_label" for="stoolbook_anchored_catalog" title="...">
+    <input type="checkbox" id="stoolbook_anchored_catalog" />
+    <span data-i18n="两阶段工具目录">两阶段工具目录 (Anchored)</span>
+</label>
+<div id="stoolbook_anchor_whitelist_wrap" style="display:none; ...">
+    <small>引导工具白名单（逗号分隔，留空则使用工具代码中的 anchor: true）</small>
+    <input type="text" id="stoolbook_anchor_whitelist" class="text_pole" placeholder="read, search" />
+</div>
+```
+
+### 4. 工具代码格式扩展
+
+工具定义新增**可选字段** `anchor`：
+
+```js
+return {
+    name: 'read_lore',
+    description: '读取设定条目',
+    anchor: true,   // ← 新增：bootstrap 阶段可见（引导工具）
+    parameters: { type: 'object', properties: { topic: { type: 'string' } }, required: ['topic'] },
+    action: async (args, api) => { ... },
+};
+```
+
+未标记 `anchor` 的工具为"标准工具"，bootstrap 阶段被隐藏，晋升后可见。
+
+### 5. 使用与验证
+
+**开启：**
+
+1. 扩展设置 → 勾选"两阶段工具目录 (Anchored)"；
+2. 给引导工具打标（工具代码加 `anchor: true`，或设置白名单）；
+3. 新开聊天生效。
+
+**验证（浏览器控制台 / 网络面板）：**
+
+- 控制台日志：新聊天首轮生成前 `Anchored 阶段恢复: bootstrap`；第一次工具调用时
+  `Anchored Tool Catalog 阶段 → full` + `Anchored 阶段已持久化到聊天 metadata: full`；
+- 抓 `chat/completions` 请求体：首个请求的 `tools` 只含引导工具，晋升后为全量，且**只变化一次**。
+
+### 6. 测试
+
+`test/anchored-catalog.test.py` 用 Python 等价复刻门控逻辑，覆盖 15 个场景
+（默认行为不变 / anchor 标记 / 白名单 / 空目录兜底 / 晋升 / 幂等 / metadata 恢复）：
+
+```sh
+python3 test/anchored-catalog.test.py   # 15 passed, 0 failed
+```
+
+### 7. 已知限制
+
+- 只门控 SToolBook 自己注册的工具，官方及第三方扩展工具不受影响（半门控）；
+- 效果依赖模型对可见工具目录的敏感度，建议用自己的模型 / 预设实测；
+- bootstrap 阶段建议放"读取 / 检索类"轻量工具，避免把大动作工具放入引导目录；
+- 若模型长期不调用工具，将一直停留在 bootstrap 阶段（与 dsh 行为一致，可关闭功能或手动切换聊天重置）。
+
+---
+
 ## 结语
 
 SToolBook 适合以下场景：
@@ -893,3 +1104,21 @@ SToolBook 适合以下场景：
 - 想在工具里直接操作正文、reasoning、后台补全与循环控制
 
 如果你已经在使用 SPreset 或其它 prompt 重写扩展，SToolBook 也提供了额外的兼容桥接接口，方便做联动开发。
+
+---
+
+## 本分支与上游差异
+
+本分支基于上游 `starowo/SToolBook`（v1.3.0）修改，唯一的功能性差异是新增
+**Anchored Tool Catalog（两阶段工具目录）**，具体变更：
+
+| 文件 | 上游 | 本分支 |
+|---|---|---|
+| `tool-runtime.js` | 无门控；`shouldRegister` 只判断条目激活 | 新增门控状态 / API；`shouldRegister` 叠加阶段门控；`beginToolInvocation` 晋升兜底；bootstrap 空目录警告 |
+| `index.js` | 设置 5 项 | 新增 `anchoredCatalog` / `anchorToolWhitelist` 设置；chatMetadata 持久化；`hasToolCalls` 晋升检测；`CHAT_CHANGED` 恢复阶段 |
+| `settings.html` | 5 个控件 | 新增两阶段工具目录开关 + 白名单输入框 |
+| `README.md` | 无改动说明 | 新增"Anchored Tool Catalog 改动说明"章节 |
+| `test/anchored-catalog.test.py` | 不存在 | 新增（15 场景逻辑验证） |
+| `examples/anchored-tools.js` | 不存在 | 新增（anchor 示例） |
+
+其余行为（无缝工具循环、回合合并、运行时 API、跨扩展兼容接口等）与上游保持一致。

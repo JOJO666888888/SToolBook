@@ -9,10 +9,14 @@ import { loadToolFuncData, saveToolFuncData } from './tool-storage.js';
 import {
     beginToolBatch,
     beginToolInvocation,
+    configureAnchoredCatalog,
     endToolBatch,
     endToolInvocation,
+    getAnchoredPhase,
     replaceActivatedEntries,
     replaceLoadedToolEntries,
+    setAnchoredPhase,
+    setAnchoredPhaseChangedHandler,
     syncToolRegistrations,
     unregisterAllTools,
     clearSeamlessLoopStopRequest,
@@ -31,6 +35,8 @@ const DEFAULT_SETTINGS = {
     pinNewestTurn: false,
     reasoningPassback: false,
     debugMode: false,
+    anchoredCatalog: false,
+    anchorToolWhitelist: '',
 };
 
 /** 生成结束后等待的毫秒数，防止打断工具调用循环或遗漏最后一条消息 */
@@ -83,6 +89,63 @@ function initSettings() {
 
 function getSettings() {
     return SillyTavern.getContext().extensionSettings[MODULE_NAME] ?? DEFAULT_SETTINGS;
+}
+
+// ============================================================
+// Anchored Tool Catalog —— 两阶段工具目录（设置 + 持久化）
+// ============================================================
+
+/** chatMetadata 里保存阶段状态的 key（per-chat 持久化，跟随聊天存档保存/恢复） */
+const ANCHORED_PHASE_META_KEY = 'stoolbookAnchoredPhase';
+
+function parseAnchorWhitelist(raw) {
+    return String(raw ?? '')
+        .split(',')
+        .map((name) => name.trim())
+        .filter(Boolean);
+}
+
+/** 把设置里的开关/白名单同步到 tool-runtime */
+function syncAnchoredCatalogConfig() {
+    const s = getSettings();
+    configureAnchoredCatalog({
+        enabled: s.anchoredCatalog,
+        anchorNames: parseAnchorWhitelist(s.anchorToolWhitelist),
+    });
+}
+
+/**
+ * 从当前聊天的 metadata 恢复阶段。
+ * - 已有记录（bootstrap/full）→ 按记录恢复（resume/reload 不丢状态）
+ * - 无记录且功能开启 → 新聊天，从 bootstrap 开始
+ * - 无记录且功能关闭 → full（无意义值，仅保持内部一致）
+ */
+function restoreAnchoredPhaseFromMetadata() {
+    const ctx = SillyTavern.getContext();
+    const stored = ctx?.chatMetadata?.[ANCHORED_PHASE_META_KEY];
+    const s = getSettings();
+
+    let phase = 'full';
+    if (stored === 'bootstrap' || stored === 'full') {
+        phase = stored;
+    } else if (s.anchoredCatalog) {
+        phase = 'bootstrap';
+    }
+
+    setAnchoredPhase(phase, { silent: true });
+    debugLog(`Anchored 阶段恢复: ${phase}${stored ? ' (来自 chatMetadata)' : ' (默认)'}`);
+}
+
+/** 阶段晋升时持久化到 chatMetadata，跟随聊天存档保存 */
+function onAnchoredPhaseChanged(phase) {
+    const ctx = SillyTavern.getContext();
+    if (!ctx?.chatMetadata) return;
+
+    ctx.chatMetadata[ANCHORED_PHASE_META_KEY] = phase;
+    if (typeof ctx.saveChat === 'function') {
+        ctx.saveChat().catch(() => {});
+    }
+    debugLog(`Anchored 阶段已持久化到聊天 metadata: ${phase}`);
 }
 
 // ============================================================
@@ -709,6 +772,12 @@ function installSeamlessOverrides() {
 
     ToolManager.hasToolCalls = function (data) {
         const has = _origHasToolCalls(data);
+
+        // Anchored Tool Catalog：模型响应里出现 tool_calls 即视为“会话已产生 tool/call”，触发晋升（幂等）
+        if (has && getSettings().anchoredCatalog && getAnchoredPhase() === 'bootstrap') {
+            setAnchoredPhase('full');
+        }
+
         if (seamlessActive && has) {
             lastHadToolCalls = true;
             debugLog('seamless hasToolCalls: 检测到工具调用，返回 false');
@@ -1248,7 +1317,32 @@ function setupDebugUnlock() {
             saveSettingsDebounced();
         });
 
+        // ---- Anchored Tool Catalog UI ----
+        function syncAnchoredUI() {
+            const enabled = getSettings().anchoredCatalog;
+            $('#stoolbook_anchor_whitelist_wrap').toggle(enabled);
+        }
+
+        $('#stoolbook_anchored_catalog').prop('checked', settings.anchoredCatalog);
+        $('#stoolbook_anchored_catalog').on('change', function () {
+            const ext = SillyTavern.getContext().extensionSettings;
+            ext[MODULE_NAME].anchoredCatalog = $(this).prop('checked');
+            saveSettingsDebounced();
+            syncAnchoredCatalogConfig();
+            syncAnchoredUI();
+            debugLog(`Anchored Tool Catalog ${$(this).prop('checked') ? '开启' : '关闭'}`);
+        });
+
+        $('#stoolbook_anchor_whitelist').val(settings.anchorToolWhitelist ?? '');
+        $('#stoolbook_anchor_whitelist').on('change', function () {
+            const ext = SillyTavern.getContext().extensionSettings;
+            ext[MODULE_NAME].anchorToolWhitelist = $(this).val();
+            saveSettingsDebounced();
+            syncAnchoredCatalogConfig();
+        });
+
         syncSeamlessUI();
+        syncAnchoredUI();
         setupDebugUnlock();
 
         $(document).on('click', '[class*="stoolbook-tool-summary"] > summary', function (e) {
@@ -1261,6 +1355,11 @@ function setupDebugUnlock() {
                 details.attr('open', '');
             }
         });
+
+        // Anchored Tool Catalog：同步设置 → 注册持久化回调 → 恢复当前聊天阶段
+        syncAnchoredCatalogConfig();
+        setAnchoredPhaseChangedHandler(onAnchoredPhaseChanged);
+        restoreAnchoredPhaseFromMetadata();
 
         installSeamlessOverrides();
         installGlobalPromptCompat();
@@ -1349,6 +1448,9 @@ function setupDebugUnlock() {
 
     eventSource.on(event_types.CHAT_CHANGED, () => {
         debugLog('事件: CHAT_CHANGED');
+        // Anchored Tool Catalog：切换聊天 → 重新同步配置并从新聊天的 metadata 恢复阶段
+        syncAnchoredCatalogConfig();
+        restoreAnchoredPhaseFromMetadata();
         if (!getSettings().seamlessToolLoop) {
             scheduleMerge();
         }
